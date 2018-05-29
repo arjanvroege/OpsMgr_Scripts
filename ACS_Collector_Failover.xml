@@ -1,0 +1,422 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ManagementPack SchemaVersion="2.0" ContentReadable="true" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Manifest>
+    <Identity>
+      <ID>ACS_Collector_Failover</ID>
+      <Version>1.0.0.7</Version>
+    </Identity>
+    <Name>ACS Collector Failover</Name>
+    <References>
+      <Reference Alias="MSAI">
+        <ID>Microsoft.SystemCenter.ACS.Internal</ID>
+        <Version>7.0.8560.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="Windows">
+        <ID>Microsoft.Windows.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="Health">
+        <ID>System.Health.Library</ID>
+        <Version>7.0.8427.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="System">
+        <ID>System.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+    </References>
+  </Manifest>
+  <TypeDefinitions>
+    <ModuleTypes>
+      <DataSourceModuleType ID="ACS.Collector.Failover.DataSourceModule.ACSFailoverMonitor" Accessibility="Internal" Batching="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="0" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="ComputerName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+        </OverrideableParameters>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <DataSource ID="Schedule" TypeID="System!System.SimpleScheduler">
+                <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+                <SyncTime>$Config/SyncTime$</SyncTime>
+              </DataSource>
+              <ProbeAction ID="Probe" TypeID="ACS.Collector.Failover.ProbeActionModule.ACSFailoverMonitor">
+                <ComputerName>$Config/ComputerName$</ComputerName>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="Probe">
+                <Node ID="Schedule" />
+              </Node>
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+      </DataSourceModuleType>
+      <ProbeActionModuleType ID="ACS.Collector.Failover.ProbeActionModule.ACSFailoverMonitor" Accessibility="Internal" Batching="false" PassThrough="false">
+        <Configuration>
+          <xsd:element minOccurs="1" name="ComputerName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <ModuleImplementation Isolation="Any">
+          <Composite>
+            <MemberModules>
+              <ProbeAction ID="PSScript" TypeID="Windows!Microsoft.Windows.PowerShellPropertyBagProbe">
+                <ScriptName>ACSFailoverMonitor.ps1</ScriptName>
+                <ScriptBody><![CDATA[# ACSFailoverMonitor.ps1
+# Written by Arjan Vroege. All rights reserved.
+
+param($ComputerName)
+
+Import-Module OperationsManager
+New-SCOMManagementGroupConnection
+
+$scomapi		   = new-object -comObject "MOM.ScriptAPI"
+$PropBag           = $scomapi.CreatePropertyBag()
+$active_collector  = Get-ItemProperty -Path HKLM:\SOFTWARE\SCOM\ACSCollector -Name Active
+$active_collector  = $active_collector.Active
+
+
+$acs_collectors    = Get-SCOMClass -Name 'Microsoft.SystemCenter.ACS.Collector' | Get-SCOMClassInstance | select DisplayName
+foreach($collector in $acs_collectors) {
+    if($collector.DisplayName -ne $ComputerName) {
+        $remote_collector = $collector.DisplayName
+		#$scomapi.LogScriptEvent("ACSFailoverMonitor.ps1",101,2, "Script is running. Computername = $ComputerName and remote collector is $remote_collector.")
+    }
+}
+
+$PSSession         = New-PSSession -Computer $remote_collector -ErrorAction SilentlyContinue
+
+if(-not($PSSession)) {
+    if($remote_collector -eq $active_collector) {
+        Write-Warning "Active $remote_collector inaccessible!"
+
+        $PropBag.AddValue('Result', 'Failure')
+        $PropBag.AddValue('FaultDescription', "Active $remote_collector  inaccessible!")
+    } else {
+        Write-Warning "Disabled $remote_collector inaccessible!"
+
+        $PropBag.AddValue('Result', 'Warning')
+        $PropBag.AddValue('FaultDescription', "Disabled $remote_collector inaccessible!")
+    }
+} else {
+    $Service = Invoke-Command -Session $PSSession -ScriptBlock { Get-Service -Name AdtServer }
+    
+    if(($Service.Status-eq 'Stopped') -and ($remote_collector -ne $active_collector ) ) {
+        Write-Host "Disabled Collector! AdtServer Service State is Disabled"
+
+        $PropBag.AddValue('Result', 'Healthy')
+        $PropBag.AddValue('FaultDescription', "Disabled Collector! AdtServer Service State is Disabled!")
+
+    } elseif(($Service.Status-eq 'Stopped') -and ($remote_collector -eq $active_collector )) {
+        Write-Warning "Active Collector is UP! AdtServer Service State is stopped!"
+
+        $PropBag.AddValue('Result', 'Failure')
+        $PropBag.AddValue('FaultDescription', "Active Collector is UP! AdtServer Service State is stopped!")
+    } elseif(($Service.Status-eq 'Running') -and ($remote_collector -eq $active_collector )) {
+        Write-Host "Active Collector is UP! AdtServer Service State is running!"
+
+        $PropBag.AddValue('Result', 'Healthy')
+        $PropBag.AddValue('FaultDescription', "Active Collector is UP! AdtServer Service State is running!")
+    }
+}
+
+
+Exit-PSSession
+
+$PropBag
+
+
+]]></ScriptBody>
+                <Parameters>
+                  <Parameter>
+                    <Name>ComputerName</Name>
+                    <Value>$Config/ComputerName$</Value>
+                  </Parameter>
+                </Parameters>
+                <TimeoutSeconds>300</TimeoutSeconds>
+              </ProbeAction>
+            </MemberModules>
+            <Composition>
+              <Node ID="PSScript" />
+            </Composition>
+          </Composite>
+        </ModuleImplementation>
+        <OutputType>System!System.PropertyBagData</OutputType>
+        <InputType>System!System.BaseData</InputType>
+      </ProbeActionModuleType>
+    </ModuleTypes>
+    <MonitorTypes>
+      <UnitMonitorType ID="ACS.Collector.Failover.ACSFailoverMonitor.MonitorType" Accessibility="Internal">
+        <MonitorTypeStates>
+          <MonitorTypeState ID="Success" NoDetection="false" />
+          <MonitorTypeState ID="Failure" NoDetection="false" />
+          <MonitorTypeState ID="Warning" NoDetection="false" />
+        </MonitorTypeStates>
+        <Configuration>
+          <xsd:element minOccurs="1" name="ComputerName" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="IntervalSeconds" type="xsd:integer" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+          <xsd:element minOccurs="1" name="SyncTime" type="xsd:string" xmlns:xsd="http://www.w3.org/2001/XMLSchema" />
+        </Configuration>
+        <OverrideableParameters>
+          <OverrideableParameter ID="IntervalSeconds" Selector="$Config/IntervalSeconds$" ParameterType="int" />
+          <OverrideableParameter ID="SyncTime" Selector="$Config/SyncTime$" ParameterType="string" />
+        </OverrideableParameters>
+        <MonitorImplementation>
+          <MemberModules>
+            <DataSource ID="DataSource" TypeID="ACS.Collector.Failover.DataSourceModule.ACSFailoverMonitor">
+              <IntervalSeconds>$Config/IntervalSeconds$</IntervalSeconds>
+              <SyncTime>$Config/SyncTime$</SyncTime>
+              <ComputerName>$Config/ComputerName$</ComputerName>
+            </DataSource>
+            <ProbeAction ID="PassThru" TypeID="System!System.PassThroughProbe" />
+            <ProbeAction ID="Probe" TypeID="ACS.Collector.Failover.ProbeActionModule.ACSFailoverMonitor">
+              <ComputerName>$Config/ComputerName$</ComputerName>
+            </ProbeAction>
+            <ConditionDetection ID="FilterSuccess" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Healthy</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="FilterWarning" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Warning</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+            </ConditionDetection>
+            <ConditionDetection ID="FilterFailure" TypeID="System!System.ExpressionFilter">
+              <Expression>
+                <SimpleExpression>
+                  <ValueExpression>
+                    <XPathQuery Type="String">Property[@Name='Result']</XPathQuery>
+                  </ValueExpression>
+                  <Operator>Equal</Operator>
+                  <ValueExpression>
+                    <Value Type="String">Failure</Value>
+                  </ValueExpression>
+                </SimpleExpression>
+              </Expression>
+              <SuppressionSettings>
+                <MatchCount>2</MatchCount>
+              </SuppressionSettings>
+            </ConditionDetection>
+          </MemberModules>
+          <RegularDetections>
+            <RegularDetection MonitorTypeStateID="Success">
+              <Node ID="FilterSuccess">
+                <Node ID="DataSource" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Warning">
+              <Node ID="FilterWarning">
+                <Node ID="DataSource" />
+              </Node>
+            </RegularDetection>
+            <RegularDetection MonitorTypeStateID="Failure">
+              <Node ID="FilterFailure">
+                <Node ID="DataSource" />
+              </Node>
+            </RegularDetection>
+          </RegularDetections>
+          <OnDemandDetections>
+            <OnDemandDetection MonitorTypeStateID="Success">
+              <Node ID="FilterSuccess">
+                <Node ID="Probe">
+                  <Node ID="PassThru" />
+                </Node>
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Warning">
+              <Node ID="FilterWarning">
+                <Node ID="Probe">
+                  <Node ID="PassThru" />
+                </Node>
+              </Node>
+            </OnDemandDetection>
+            <OnDemandDetection MonitorTypeStateID="Failure">
+              <Node ID="FilterFailure">
+                <Node ID="Probe">
+                  <Node ID="PassThru" />
+                </Node>
+              </Node>
+            </OnDemandDetection>
+          </OnDemandDetections>
+        </MonitorImplementation>
+      </UnitMonitorType>
+    </MonitorTypes>
+  </TypeDefinitions>
+  <Monitoring>
+    <Monitors>
+      <UnitMonitor ID="ACS.Collector.Failover.ACSFailoverMonitor" Accessibility="Public" Enabled="true" Target="MSAI!Microsoft.SystemCenter.ACS.Collector" ParentMonitorID="Health!System.Health.AvailabilityState" Remotable="true" Priority="Normal" TypeID="ACS.Collector.Failover.ACSFailoverMonitor.MonitorType" ConfirmDelivery="false">
+        <Category>AvailabilityHealth</Category>
+        <OperationalStates>
+          <OperationalState ID="Success" MonitorTypeStateID="Success" HealthState="Success" />
+          <OperationalState ID="Failure" MonitorTypeStateID="Failure" HealthState="Error" />
+          <OperationalState ID="Warning" MonitorTypeStateID="Warning" HealthState="Warning" />
+        </OperationalStates>
+        <Configuration>
+          <ComputerName>$Target/Host/Property[Type="Windows!Microsoft.Windows.Computer"]/PrincipalName$</ComputerName>
+          <IntervalSeconds>300</IntervalSeconds>
+          <SyncTime />
+        </Configuration>
+      </UnitMonitor>
+    </Monitors>
+    <Recoveries>
+      <Recovery ID="ACS.Collector.Failover.ACSFailoverMonitor.Recovery" Accessibility="Internal" Enabled="true" Target="MSAI!Microsoft.SystemCenter.ACS.Collector" Monitor="ACS.Collector.Failover.ACSFailoverMonitor" ResetMonitor="false" Remotable="true" Timeout="300" ExecuteOnState="Error">
+        <Category>Custom</Category>
+        <WriteAction ID="Script" TypeID="Windows!Microsoft.Windows.PowerShellWriteAction">
+          <ScriptName>ACSFailover.ps1</ScriptName>
+          <ScriptBody><![CDATA[##### Section 1 - Initialization #####
+#
+#Import the OperationsManager Powershell module and create connection to SCOM Management Server
+Import-Module OperationsManager
+New-SCOMManagementGroupConnection
+#
+##### End Section 1  ############
+
+##### Section 2 - Variables #####
+#
+#Define the Management Pack naming for the Overrides Management Pack for Audit Collection Services
+$mp_name           = "Custom.ACS.Failover.Overrides"
+$active_coll_up	   = '1' 
+#
+##### End Section 2  ############
+
+##### Section 3 - Script Logic #####
+#
+#Check if ACS Override Management Pack exists in the SCOM environment, if not a new Management Pack will be created
+$MP       = Get-SCOMManagementPack -Name $mp_name | where {$_.Sealed -eq $False}
+
+if (!$MP) {
+    Write-Output "Management Pack does not exist. Will be created"
+    $mp_store          = New-Object Microsoft.EnterpriseManagement.Configuration.IO.ManagementPackFileStore
+    $mp_object         = New-Object Microsoft.EnterpriseManagement.Configuration.ManagementPack($mp_name, $mp_name, (New-Object Version(1, 0, 0,0)), $mp_store)
+
+    Import-SCOMManagementPack $mp_object
+
+    $MP       = Get-SCOMManagementPack -Name $mp_name | where {$_.Sealed -eq $False}
+}
+
+$active_collector  = Get-ItemProperty -Path HKLM:\SOFTWARE\SCOM\ACSCollector -Name Active
+$active_collector  = $active_collector.Active
+
+$acs_collectors    = Get-SCOMClass -Name 'Microsoft.SystemCenter.ACS.Collector' | Get-SCOMClassInstance | select DisplayName
+foreach($collector in $acs_collectors) {
+    if($collector.DisplayName -ne $active_collector) {
+        $standby_collector = $collector.DisplayName
+    }
+}
+
+$PSSession_active_col	= New-PSSession -Computer $active_collector -ErrorAction SilentlyContinue
+$PSSession_standby_col	= New-PSSession -Computer $standby_collector -ErrorAction SilentlyContinue
+
+if(-not($PSSession_active_col)) {
+	$active_coll_up = '0' 
+	Write-Output "WARNING: Collector Failover: Active Collector could not be disabled. This need to be done manually"
+}
+
+if(-not($PSSession_standby_col)) {
+	Write-Output "ERROR: Collector Failover: Standby Collector could not activated. Script is exited"
+	Exit-PSSession
+	Exit
+}
+if($active_coll_up -eq '1') {
+	#Set the failed Collector to Disabled
+	Invoke-Command -Session $PSSession_active_col -Scriptblock { Set-Service -Name 'AdtServer' -StartupType Disabled } -ErrorAction SilentlyContinue
+}
+
+if(($? -eq $True) -or ($active_coll_up -eq '0' )) {
+        #Activate the Standby Collector
+        Invoke-Command -Session $PSSession_standby_col -Scriptblock {
+			Set-Service -Name 'AdtServer' -StartupType Automatic 
+			Set-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AdtServer -Name "DelayedAutostart" -Value 1 -Type DWORD
+		}
+        
+        if($? -eq $True) {
+            Invoke-Command -Session $PSSession_standby_col -Scriptblock { Set-Service -Name 'AdtServer' -Status Running }
+
+            
+            if($? -eq $True) {
+                $active_instance    = Get-SCOMClass -DisplayName 'Microsoft Audit Collection Services Collector' | Get-SCOMClassInstance | Where-Object {$_.Displayname -eq $active_collector}
+                $standby_instance   = Get-SCOMClass -DisplayName 'Microsoft Audit Collection Services Collector' | Get-SCOMClassInstance | Where-Object {$_.Displayname -eq $standby_collector}
+
+                If($? -eq $true) {
+                    $Monitor_service   = Get-SCOMMonitor -DisplayName 'Microsoft Audit Collection Services Collector Running State'
+                    $Monitor_database  = Get-SCOMMonitor -DisplayName 'Microsoft Audit Collector Service Collector Database Connection Establishment State'
+    
+                    If($? -eq $true) {
+                        #Enable the State Monitor for the 'new' Active Instance 
+                        Enable-SCOMMonitor -Instance $standby_instance -ManagementPack $MP -Monitor $Monitor_service
+                        Enable-SCOMMonitor -Instance $standby_instance -ManagementPack $MP -Monitor $Monitor_database
+        
+                        #Disable the State Monitor for the 'new' Standby Instance 
+                        Disable-SCOMMonitor -Instance $active_instance -ManagementPack $MP -Monitor $Monitor_service
+                        Disable-SCOMMonitor -Instance $active_instance -ManagementPack $MP -Monitor $Monitor_database
+						
+						#Set Registry key active collector on collectors
+						if($active_coll_up -eq '1') {
+							Invoke-Command -Session $PSSession_active_col -Scriptblock { param($standby_collector) Set-ItemProperty -Path HKLM:\SOFTWARE\SCOM\ACSCollector -Name Active -Value $standby_collector } -ArgumentList $standby_collector -ErrorAction SilentlyContinue
+						}
+						Invoke-Command -Session $PSSession_standby_col -Scriptblock { param($standby_collector) Set-ItemProperty -Path HKLM:\SOFTWARE\SCOM\ACSCollector -Name Active -Value $standby_collector } -ArgumentList $standby_collector -ErrorAction SilentlyContinue
+
+                    } else {
+                        Write-Output "Collector Failover Success, but override configuration could not be changed "
+                    }
+                } else {
+                    Write-Output "Collector Failover Success, but override configuration could not be changed"
+                }
+            } else {
+                Write-Output "Standby Collector Service could not be started. Manual action needed. Script exists.."
+                Exit
+            }
+        } else {
+            Write-Output "Standby Collector Service could not be activated. Manual action needed. Script exists.."
+            Exit
+        } 
+} else {
+    Write-Output "Active ACS Collector could not be disabled. Manual action needed. Script exists.."
+    Exit
+}
+
+if($active_coll_up -eq '1') {
+	Remove-PSSession -Session $PSSession_active_col
+}
+Remove-PSSession -Session $PSSession_standby_col]]></ScriptBody>
+          <TimeoutSeconds>300</TimeoutSeconds>
+        </WriteAction>
+      </Recovery>
+    </Recoveries>
+  </Monitoring>
+  <LanguagePacks>
+    <LanguagePack ID="ENU">
+      <DisplayStrings>
+        <DisplayString ElementID="ACS.Collector.Failover.ACSFailoverMonitor">
+          <Name>ACS Failover Monitor</Name>
+        </DisplayString>
+      </DisplayStrings>
+      <KnowledgeArticles></KnowledgeArticles>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPack>
